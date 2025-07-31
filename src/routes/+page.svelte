@@ -14,7 +14,7 @@
 <div class="h-screen flex flex-col bg-cad-bg">
   <!-- Header -->
   <header class="bg-white border-b border-gray-200 px-4 py-2">
-    <h1 class="text-xl font-bold text-gray-800">3D CAD Design Tool</h1>
+    <h1 class="text-xl font-bold text-gray-800">AAD</h1>
   </header>
   
   <!-- Toolbar -->

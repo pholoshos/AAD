@@ -2,13 +2,14 @@
   import { onMount, onDestroy } from 'svelte';
   import * as THREE from 'three';
   import { sceneObjects, selectedObjectId, sceneSettings, transformMode, sceneActions, editMode, selectedFaces, gizmoMode } from '../stores/sceneStore.js';
-  import { initializeThreeJS, createGeometry, createMaterial } from '../utils/threeSetup.js';
+  import { initializeThreeJS, createGeometry, createMaterial, createWireframeMesh } from '../utils/threeSetup.js';
   import { AdvancedGeometry } from '../utils/advancedGeometry.js';
   import { TransformGizmo } from '../utils/transformGizmo.js';
   import { FaceExtrusionGizmo } from '../utils/faceExtrusion.js';
+  import { CuttingGizmo } from '../utils/cuttingGizmo.js';
   
   let canvasContainer;
-  let scene, camera, renderer, gridHelper;
+  let scene, camera, renderer, composer, outlinePass, gridHelper;
   let meshes = new Map();
   let raycaster = new THREE.Raycaster();
   let mouse = new THREE.Vector2();
@@ -18,6 +19,7 @@
   // Gizmos
   let transformGizmo;
   let faceExtrusionGizmo;
+  let cuttingGizmo;
   
   // Camera controls
   let isMouseDown = false;
@@ -34,6 +36,8 @@
     scene = threeSetup.scene;
     camera = threeSetup.camera;
     renderer = threeSetup.renderer;
+    composer = threeSetup.composer;
+    outlinePass = threeSetup.outlinePass;
     gridHelper = threeSetup.gridHelper;
     
     // Setup orbit controls
@@ -46,8 +50,10 @@
     // Initialize gizmos
     transformGizmo = new TransformGizmo(camera, renderer);
     faceExtrusionGizmo = new FaceExtrusionGizmo(camera, renderer);
+    cuttingGizmo = new CuttingGizmo(camera, renderer);
     scene.add(transformGizmo.gizmo);
     scene.add(faceExtrusionGizmo.gizmo);
+    scene.add(cuttingGizmo.gizmo);
     
     // Add event listeners
     renderer.domElement.addEventListener('click', onCanvasClick);
@@ -123,6 +129,20 @@
           duplicateSelected();
         }
         break;
+      case 'c':
+        event.preventDefault();
+        sceneActions.setGizmoMode('cut');
+        break;
+      case 'enter':
+        if ($gizmoMode === 'cut' && $selectedObjectId && cuttingGizmo) {
+          event.preventDefault();
+          function performCutOperation() {
+            if (cuttingGizmo && $selectedObjectId) {
+              cuttingGizmo.performCut();
+            }
+          }
+        }
+        break;
     }
   }
   
@@ -153,8 +173,23 @@
   $: updateEditMode($editMode, $selectedFaces);
   
   function updateGizmoMode(mode) {
-    if (transformGizmo) {
-      transformGizmo.setMode(mode);
+    if (transformGizmo && faceExtrusionGizmo && cuttingGizmo) {
+      // Hide all gizmos first
+      transformGizmo.hide();
+      faceExtrusionGizmo.hide();
+      cuttingGizmo.hide();
+      
+      // Show appropriate gizmo based on mode
+      if (mode === 'cut' && $selectedObjectId) {
+        const selectedMesh = meshes.get($selectedObjectId);
+        cuttingGizmo.attachToObject(selectedMesh);
+      } else if (['translate', 'rotate', 'scale'].includes(mode)) {
+        transformGizmo.setMode(mode);
+        if ($selectedObjectId) {
+          const selectedMesh = meshes.get($selectedObjectId);
+          transformGizmo.attachToObject(selectedMesh);
+        }
+      }
     }
   }
   
@@ -197,33 +232,51 @@
       }
     }
     
+    // Clear outline pass selection safely
+    if (outlinePass) {
+      outlinePass.selectedObjects = [];
+    }
+    
+    // Track selected mesh for outline pass
+    let selectedMeshForOutline = null;
+    
     // Add or update meshes
     objects.forEach(obj => {
-      let mesh = meshes.get(obj.id);
+      let meshGroup = meshes.get(obj.id);
       
-      if (!mesh) {
-        // Create new mesh
+      if (!meshGroup) {
+        // Create new wireframe mesh group
         const geometry = createGeometry(obj.type, obj.geometry);
-        const material = createMaterial(obj.material, obj.id === selectedId);
-        mesh = new THREE.Mesh(geometry, material);
-        // Remove shadow properties since we're not using lighting
-        // mesh.castShadow = true;
-        // mesh.receiveShadow = true;
-        mesh.userData = { objectId: obj.id };
+        meshGroup = createWireframeMesh(geometry, obj.material, obj.id === selectedId);
+        meshGroup.userData = { objectId: obj.id };
         
-        scene.add(mesh);
-        meshes.set(obj.id, mesh);
+        scene.add(meshGroup);
+        meshes.set(obj.id, meshGroup);
       } else {
-        // Update existing mesh material for selection
-        mesh.material = createMaterial(obj.material, obj.id === selectedId);
+        // Update existing mesh materials for selection
+        const materials = createMaterial(obj.material, obj.id === selectedId, true);
+        if (meshGroup.userData.solidMesh && meshGroup.userData.wireframeMesh) {
+          meshGroup.userData.solidMesh.material = materials.solid;
+          meshGroup.userData.wireframeMesh.material = materials.wireframe;
+        }
       }
       
       // Update transform
-      mesh.position.set(obj.position.x, obj.position.y, obj.position.z);
-      mesh.rotation.set(obj.rotation.x, obj.rotation.y, obj.rotation.z);
-      mesh.scale.set(obj.scale.x, obj.scale.y, obj.scale.z);
-      mesh.visible = obj.visible;
+      meshGroup.position.set(obj.position.x, obj.position.y, obj.position.z);
+      meshGroup.rotation.set(obj.rotation.x, obj.rotation.y, obj.rotation.z);
+      meshGroup.scale.set(obj.scale.x, obj.scale.y, obj.scale.z);
+      meshGroup.visible = obj.visible;
+      
+      // Track selected mesh for outline pass
+      if (obj.id === selectedId && meshGroup.userData.solidMesh) {
+        selectedMeshForOutline = meshGroup.userData.solidMesh;
+      }
     });
+    
+    // Set outline pass selection only if we have a valid selected mesh
+    if (outlinePass && selectedMeshForOutline) {
+      outlinePass.selectedObjects = [selectedMeshForOutline];
+    }
   }
   
   function updateGridVisibility(visible) {
@@ -255,32 +308,66 @@
     
     raycaster.setFromCamera(mouse, camera);
     
-    const meshArray = Array.from(meshes.values());
-    const intersects = raycaster.intersectObjects(meshArray);
+    // Get all meshes for raycasting - include both solid meshes and wireframe groups
+    const meshArray = [];
+    for (const meshGroup of meshes.values()) {
+      // Add the solid mesh for raycasting (more reliable than wireframe)
+      if (meshGroup.userData && meshGroup.userData.solidMesh) {
+        meshArray.push(meshGroup.userData.solidMesh);
+      }
+      // Also add the group itself as fallback
+      meshArray.push(meshGroup);
+    }
+    
+    const intersects = raycaster.intersectObjects(meshArray, true); // recursive = true
     
     if (intersects.length > 0) {
-      const selectedMesh = intersects[0].object;
-      const objectId = selectedMesh.userData.objectId;
+      const intersectedObject = intersects[0].object;
+      let objectId = null;
       
-      if ($editMode === 'edit' && $selectedObjectId === objectId) {
-        // Face selection in edit mode
-        const faceIndex = intersects[0].faceIndex;
-        sceneActions.selectFace(faceIndex);
-        updateFaceHighlights(selectedMesh);
-      } else {
-        // Object selection
-        sceneActions.selectObject(objectId);
-        if ($editMode === 'edit') {
-          sceneActions.exitEditMode();
+      // Find the object ID by traversing up the hierarchy
+      let currentObject = intersectedObject;
+      while (currentObject && !objectId) {
+        if (currentObject.userData && currentObject.userData.objectId) {
+          objectId = currentObject.userData.objectId;
+          break;
+        }
+        // Check if parent has the objectId
+        if (currentObject.parent && currentObject.parent.userData && currentObject.parent.userData.objectId) {
+          objectId = currentObject.parent.userData.objectId;
+          break;
+        }
+        currentObject = currentObject.parent;
+      }
+      
+      if (objectId) {
+        if ($editMode === 'edit' && $selectedObjectId === objectId) {
+          // Face selection in edit mode - use the solid mesh for face detection
+          const meshGroup = meshes.get(objectId);
+          if (meshGroup && meshGroup.userData.solidMesh) {
+            const solidMeshIntersects = raycaster.intersectObject(meshGroup.userData.solidMesh);
+            if (solidMeshIntersects.length > 0) {
+              const faceIndex = solidMeshIntersects[0].faceIndex;
+              sceneActions.selectFace(faceIndex);
+              updateFaceHighlights(meshGroup.userData.solidMesh);
+            }
+          }
+        } else {
+          // Object selection
+          sceneActions.selectObject(objectId);
+          if ($editMode === 'edit') {
+            sceneActions.exitEditMode();
+          }
         }
       }
     } else {
+      // No valid object found
       sceneActions.clearSelection();
       if ($editMode === 'edit') {
         sceneActions.exitEditMode();
       }
     }
-  }
+  } 
   
   function updateFaceHighlights(mesh) {
     // Remove existing highlights
@@ -326,6 +413,11 @@
     camera.aspect = canvasContainer.clientWidth / canvasContainer.clientHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(canvasContainer.clientWidth, canvasContainer.clientHeight);
+    
+    // Update composer size
+    if (composer) {
+      composer.setSize(canvasContainer.clientWidth, canvasContainer.clientHeight);
+    }
   }
   
   function animate() {
@@ -339,11 +431,46 @@
     if (transformGizmo && transformGizmo.isVisible) {
       transformGizmo.updateSize();
     }
+    if (cuttingGizmo && cuttingGizmo.isVisible) {
+      cuttingGizmo.updateSize();
+    }
     
-    if (renderer && scene && camera) {
-      renderer.render(scene, camera);
+    // Render with post-processing - add safety checks
+    if (composer && scene && camera) {
+      try {
+        composer.render();
+      } catch (error) {
+        console.warn('Render error:', error);
+        // Fallback to direct rendering if composer fails
+        if (renderer) {
+          renderer.render(scene, camera);
+        }
+      }
     }
   }
+  
+  // Add this after the onCanvasClick function for debugging
+  function debugMeshes() {
+    console.log('Current meshes:', meshes);
+    for (const [id, meshGroup] of meshes) {
+      console.log(`Mesh ${id}:`, {
+        group: meshGroup,
+        solidMesh: meshGroup.userData?.solidMesh,
+        wireframeMesh: meshGroup.userData?.wireframeMesh,
+        objectId: meshGroup.userData?.objectId
+      });
+    }
+  }
+  
+  // Call this in onMount to verify mesh creation
+  onMount(async () => {
+    // ... existing onMount code ...
+    
+    // Add debugging after setup
+    setTimeout(() => {
+      debugMeshes();
+    }, 1000);
+  });
 </script>
 
 <div 
