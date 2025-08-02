@@ -48,7 +48,17 @@
     controls.enablePan = true;
     
     // Initialize gizmos
-    transformGizmo = new TransformGizmo(camera, renderer);
+    let isTransforming = false;
+    
+    // Update the transform gizmo initialization
+    transformGizmo = new TransformGizmo(camera, renderer, (objectId, transforms) => {
+    isTransforming = true;
+    sceneActions.updateObject(objectId, transforms);
+    // Reset flag after a short delay to allow scene update
+    setTimeout(() => {
+      isTransforming = false;
+    }, 50);
+    });
     faceExtrusionGizmo = new FaceExtrusionGizmo(camera, renderer);
     cuttingGizmo = new CuttingGizmo(camera, renderer);
     scene.add(transformGizmo.gizmo);
@@ -262,14 +272,32 @@
       }
       
       // Update transform
-      meshGroup.position.set(obj.position.x, obj.position.y, obj.position.z);
-      meshGroup.rotation.set(obj.rotation.x, obj.rotation.y, obj.rotation.z);
-      meshGroup.scale.set(obj.scale.x, obj.scale.y, obj.scale.z);
-      meshGroup.visible = obj.visible;
-      
-      // Track selected mesh for outline pass
-      if (obj.id === selectedId && meshGroup.userData.solidMesh) {
-        selectedMeshForOutline = meshGroup.userData.solidMesh;
+      // In the updateMeshes function, add a check
+      function updateMeshes(objects, selectedId) {
+        // ... existing code ...
+        
+        objects.forEach(obj => {
+          let meshGroup = meshes.get(obj.id);
+          
+          // Only update transform if not currently being transformed by gizmo
+          if (!isTransforming || obj.id !== selectedId) {
+            meshGroup.position.set(obj.position.x, obj.position.y, obj.position.z);
+            meshGroup.rotation.set(obj.rotation.x, obj.rotation.y, obj.rotation.z);
+            meshGroup.scale.set(obj.scale.x, obj.scale.y, obj.scale.z);
+          }
+          
+          meshGroup.visible = obj.visible;
+          
+          // Track selected mesh for outline pass
+          if (obj.id === selectedId && meshGroup.userData.solidMesh) {
+            selectedMeshForOutline = meshGroup.userData.solidMesh;
+          }
+        });
+        
+        // Set outline pass selection only if we have a valid selected mesh
+        if (outlinePass && selectedMeshForOutline) {
+          outlinePass.selectedObjects = [selectedMeshForOutline];
+        }
       }
     });
     

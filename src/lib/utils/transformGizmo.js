@@ -1,9 +1,10 @@
 import * as THREE from 'three';
 
 export class TransformGizmo {
-  constructor(camera, renderer) {
+  constructor(camera, renderer, onTransformCallback = null) {
     this.camera = camera;
     this.renderer = renderer;
+    this.onTransformCallback = onTransformCallback;
     this.gizmo = new THREE.Group();
     this.mode = 'translate'; // 'translate', 'rotate', 'scale'
     this.size = 1;
@@ -200,6 +201,27 @@ export class TransformGizmo {
   
   onMouseUp(event) {
     if (this.isDragging) {
+      // Sync changes back to scene store when transform is complete
+      if (this.onTransformCallback && this.targetObject && this.targetObject.userData.objectId) {
+        this.onTransformCallback(this.targetObject.userData.objectId, {
+          position: {
+            x: this.targetObject.position.x,
+            y: this.targetObject.position.y,
+            z: this.targetObject.position.z
+          },
+          rotation: {
+            x: this.targetObject.rotation.x,
+            y: this.targetObject.rotation.y,
+            z: this.targetObject.rotation.z
+          },
+          scale: {
+            x: this.targetObject.scale.x,
+            y: this.targetObject.scale.y,
+            z: this.targetObject.scale.z
+          }
+        });
+      }
+      
       this.isDragging = false;
       this.selectedAxis = null;
       this.unhighlightAll();
